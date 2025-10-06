@@ -7,3 +7,4 @@ fastmri
 scikit-learn
 matplotlib
 jupyter
+seaborn
