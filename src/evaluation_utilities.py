@@ -5,8 +5,34 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from src.models import denorm_image
 
-def calculate_metrics(data_loader, model, nsamples = None):
+def calculate_metrics_on_sample(prediction, target_data, mean, std):
+    target_denorm = denorm_image(target_data, mean = mean, std = std)
+    slice_max = target_denorm.max()
+    # 1. Root Mean Squared Error (RMSE)
+    mse = F.mse_loss(prediction, target_denorm)
+    rmse = torch.sqrt(mse).item()
+    
+    # 2. Peak Signal-to-Noise Ratio (PSNR)
+    psnr = tm.peak_signal_noise_ratio(
+        prediction, 
+        target_denorm, 
+        data_range=slice_max
+    ).item()
+    
+    # 3. Structural Similarity Index Measure (SSIM)
+
+    ssim = tm.structural_similarity_index_measure(
+        prediction, 
+        target_denorm, 
+        data_range=slice_max,
+        reduction='elementwise_mean' 
+    ).item()
+    
+    return rmse, psnr, ssim
+    
+def calculate_metrics_model(data_loader, model, nsamples = None, model_type = "Unet_only"):
     """
     Calculates the average RMSE, PSNR, and SSIM across all batches 
     in a data loader.
@@ -21,59 +47,57 @@ def calculate_metrics(data_loader, model, nsamples = None):
     Returns:
         tuple: (avg_rmse, avg_psnr, avg_ssim)
     """
-    all_rmse_scores = []
-    all_psnr_scores = []
-    all_ssim_scores = []
+    rmse_scores = []
+    psnr_scores = []
+    ssim_scores = []
     samples_processed = 0
 
     model.eval() 
     
     with torch.no_grad():
-        for input_data, target_data, mean, std, max_value in data_loader:
+        if model_type == "Unet_only":
+            for input_data, target_data, mean, std, max_value in data_loader:
 
-            if nsamples:
-                if samples_processed >= nsamples:
-                    break
+                if nsamples:
+                    if samples_processed >= nsamples:
+                        break
 
-            prediction = model(input_data)
-            prediction_denorm = (prediction * std) + mean
-            target_denorm = (target_data * std) + mean
-            #print(f"Shapes: input {input_data.shape}, prediction {prediction.shape}, target {target_data.shape}")
+                prediction = model(input_data, mean, std)
 
-            # 1. Root Mean Squared Error (RMSE)
-            mse = F.mse_loss(prediction_denorm, target_denorm)
-            rmse = torch.sqrt(mse).item()
-            all_rmse_scores.append(rmse)
-            
-            # 2. Peak Signal-to-Noise Ratio (PSNR)
-            psnr = tm.peak_signal_noise_ratio(
-                prediction_denorm, 
-                target_denorm, 
-                data_range=max_value
-            ).item()
-            all_psnr_scores.append(psnr)
-            
-            # 3. Structural Similarity Index Measure (SSIM)
+                rmse, psnr, ssim = calculate_metrics_on_sample(prediction, target_data, mean = mean, std = std)
 
-            ssim = tm.structural_similarity_index_measure(
-                prediction_denorm, 
-                target_denorm, 
-                data_range=max_value,
-                # Average across batch and channels
-                reduction='elementwise_mean' 
-            ).item()
-            all_ssim_scores.append(ssim)
-            samples_processed += 1
-            print(f"Samples processed: {samples_processed}")
+                rmse_scores.append(rmse)
+                psnr_scores.append(psnr)
+                ssim_scores.append(ssim)
+
+                samples_processed += 1
     
-    return all_rmse_scores, all_psnr_scores, all_ssim_scores
+        elif model_type == "Unet_DataConsistency":
+            for kspace_masked, mask, masked_image, target_data, mean, std, max_value in data_loader:
 
-def visualize_metrics(all_rmse_scores, all_psnr_scores, all_ssim_scores):
+                if nsamples:
+                    if samples_processed >= nsamples:
+                        break
+
+                prediction = model(kspace_masked, mask, masked_image, mean, std)
+            
+                rmse, psnr, ssim = calculate_metrics_on_sample(prediction, target_data, mean = mean, std = std)
+                rmse_scores.append(rmse)
+                psnr_scores.append(psnr)
+                ssim_scores.append(ssim)
+
+                samples_processed += 1
+
+    print(f"Samples processed: {samples_processed}")
+    
+    return rmse_scores, psnr_scores, ssim_scores
+
+def visualize_metrics(rmse_scores, psnr_scores, ssim_scores, model_name = ""):
  # Group scores and labels for iteration
     df_metrics = pd.DataFrame({
-        'RMSE': all_rmse_scores,
-        'PSNR': all_psnr_scores,
-        'SSIM': all_ssim_scores,
+        'RMSE': rmse_scores,
+        'PSNR': psnr_scores,
+        'SSIM': ssim_scores,
     })
     metadata = [
         {"color":"red", "label": "Lower is better"},
@@ -85,7 +109,7 @@ def visualize_metrics(all_rmse_scores, all_psnr_scores, all_ssim_scores):
     
     # Set up a 1x3 grid of subplots
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    plt.suptitle('Distribution of Reconstruction Metrics', fontsize=20, y=1.02)
+    plt.suptitle(f'Distribution of Reconstruction Metrics for {model_name}', fontsize=20, y=1.02)
 
     for i, metric in enumerate(df_metrics.columns):
         # Convert list to DataFrame for simple Seaborn input (wide format)
@@ -103,13 +127,23 @@ def visualize_metrics(all_rmse_scores, all_psnr_scores, all_ssim_scores):
         
         # Add mean line for context
         mean_score = df_metrics[metric].mean()
-        axes[i].axhline(
+        if metric == "RMSE":
+            axes[i].axhline(
             mean_score, 
             color='red', 
             linestyle='--', 
             linewidth=2, 
-            label=f'Mean: {mean_score:.3f}'
+            label=f'Mean: {mean_score:.2e}'
         )
+        
+        else:
+            axes[i].axhline(
+                mean_score, 
+                color='red', 
+                linestyle='--', 
+                linewidth=2, 
+                label=f'Mean: {mean_score:.3f}'
+            )
         
         # Styling
         axes[i].set_title(metric, fontsize=16, color=color)
@@ -122,12 +156,12 @@ def visualize_metrics(all_rmse_scores, all_psnr_scores, all_ssim_scores):
     plt.tight_layout()
     plt.show()
 
-    # 2. --- Visualization: Detailed Distribution Plot (Focus on PSNR) ---
+    # 2. --- Visualization: Detailed Distribution Plot (Focus on SSIM) ---
     # Shows the smoothness and frequency of scores, highlighting stability.
     plt.figure(figsize=(12, 5))
     
     sns.histplot(
-        all_psnr_scores, 
+        ssim_scores, 
         kde=True, 
         bins=20, 
         color="#2E86C1", # Using SSIM color for consistency
@@ -135,17 +169,17 @@ def visualize_metrics(all_rmse_scores, all_psnr_scores, all_ssim_scores):
     )
     
     # Add mean line
-    mean_psnr = np.mean(all_psnr_scores)
+    mean_ssim = np.mean(ssim_scores)
     plt.axvline(
-        mean_psnr, 
+        mean_ssim, 
         color='red', 
         linestyle='--', 
         linewidth=2, 
-        label=f'Mean PSNR: {mean_psnr:.2f}'
+        label=f'Mean SSIM: {mean_ssim:.2f}'
     )
     
-    plt.title('Distribution of Peak Signal-to-Noise Ratio (PSNR)', fontsize=16)
-    plt.xlabel('PSNR Score (dB)', fontsize=12)
+    plt.title(f'Distribution of SSIM for {model_name}', fontsize=16)
+    plt.xlabel('SSIM Score', fontsize=12)
     plt.ylabel('Frequency (Samples)', fontsize=12)
     plt.legend()
     plt.grid(axis='y', linestyle='--', alpha=0.7)

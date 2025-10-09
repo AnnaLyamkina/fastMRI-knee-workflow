@@ -1,14 +1,14 @@
 # FastMRI Classification Demo: Comparative Workflow
 ### 1. Project Idea and Scope
 
-This project is a **small workflow demonstration** designed to **achieve and compare** real space and k-space reconstruction of undersampled MRI data and relate initial classification results across two distinct reconstruction methods using the FastMRI knee dataset and external clinical labels (FastMRI+).
+This project is a **small workflow demonstration** designed to **achieve and compare** real space and k-space reconstruction of undersampled MRI data and relate initial classification results across two distinct reconstruction methods using the FastMRI knee dataset and external clinical labels (FastMRI+). In all reconstruction pipelines we explicitly incorporate data consistency​ in the reconstruction process. This is essential for clinical analysis, as data consistency​ ensures the reconstructed image is tethered to the original measurements, making the reconstruction more stable and preventing the generation of 'hallucinations' or artifacts that could compromise diagnosis.
 
 This comparative approach focuses on **tasked-based reconstruction (TBR)**, measuring the utility of each reconstruction method by its ultimate impact on diagnostic accuracy (Meniscus Tear detection) rather than relying solely on image quality metrics.
 
 
 ### 1.1 Core Pipeline Objectives:
 
-- Pipeline A (Real-Space Reconstruction): The process involves adapting a pretrained U-Net to refine artifacts from a zero-filled, real-space magnitude image.
+- Pipeline A (Real-Space Reconstruction): The process involves adapting a pretrained U-Net to refine artifacts from a zero-filled, real-space magnitude image. To enforce archieve data consistency​ with the measured k-space a wrapper around the U-Net is set.
 
 - Pipeline B (K-Space Reconstruction): This involves training a U-Net to directly reconstruct high-quality k-space data before conversion to a magnitude image via IFFT.
 
@@ -20,15 +20,15 @@ The core idea is to benchmark the classification performance by comparing three 
 
 **1. Flow A→C (Real-Space Reconstruction Baseline):**
 
-Image Source: Uses the image reconstructed by first performing an IFFT on the undersampled k-space (zero-filled), and then using the Pretrained U-Net (trained for Real-Space) to refine the resulting artifact-ridden image.
+Image Source: Uses the image reconstructed by first performing an IFFT on the undersampled k-space (zero-filled), and then using the Pretrained U-Net (trained for Real-Space) inside an iterative wrapper to refine the resulting artifact-ridden image. The wrapper enforces data consistency​ by alternating between the U-Net prediction in the image domain and a projection in the k-space domain, forcing the reconstructed signal to adhere to the acquired measurements.
 
-Classification: This high-quality image is fed to the same pretrained U-Net (acting as a CNN feature extractor) for classification. This establishes the performance of the advanced reconstruction method.
+Classification: This high-quality image is fed to a pretrained ResNet with a retrained head for classification. This establishes the performance of the advanced reconstruction method.
 
 **2. Flow B→IFFT→C (K-Space Reconstruction Comparison):**
 
 Image Source: Uses a second Pretrained U-Net (trained for K-space processing) to directly reconstruct the undersampled k-space data. The resulting high-quality k-space is then transformed via IFFT to create the final magnitude image.
 
-Classification: This image is also fed to the same pretrained U-Net (acting as a CNN feature extractor) for classification. This provides the K-space benchmark.
+Classification: This image is also fed to the same pretrained ResNet with a retrained head for classification. This provides the K-space benchmark.
 
 Possible extension:
 

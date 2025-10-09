@@ -2,7 +2,6 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import os
 from pathlib import Path
@@ -12,8 +11,38 @@ from typing import List, Tuple, Any
 from fastmri.data.transforms import center_crop #, center_crop_to_smallest
 from fastmri import ifft2c, complex_abs
 
-# --- Mask Generation Helper Function ---
+# Convert native complex tensors to [..., 2] format --- due to ifft2c restrictions
 
+def to_fastmri_complex_format(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Converts tensors to the fastMRI [..., 2] format, handling two cases:
+    1. Native complex tensors (torch.complex64) -> [..., 2]
+    2. Real magnitude images [B, 1, H, W] (from UNet) -> [B, H, W, 2] (zero imaginary part)
+    """
+    # Case 1: Input is native PyTorch complex (e.g., from an ifft2c implementation 
+    # that returns torch.complex64)
+    if tensor.is_complex():
+        # Stack real and imaginary parts along a new last dimension: [..., 2]
+        return torch.stack((tensor.real, tensor.imag), dim=-1)
+    
+    # Case 2: Input is real magnitude from UNet (e.g., shape [B, 1, H, W])
+    # If it's a real floating point tensor, check if it looks like a magnitude image.
+    if tensor.is_floating_point() and tensor.dim() == 4 and tensor.shape[1] == 1:
+        
+        # 1. Create zero tensor for the imaginary part [B, 1, H, W]
+        imag_part = torch.zeros_like(tensor)
+        
+        # 2. Concatenate Real and Imaginary parts along the channel dimension: [B, 2, H, W]
+        channels_first_complex = torch.cat((tensor, imag_part), dim=1)
+        
+        # 3. Permute to the FastMRI standard convention for complex tensors: [B, H, W, 2]
+        complex_tensor = channels_first_complex.permute(0, 2, 3, 1)
+        return complex_tensor
+        
+    # Case 3 (Fallback): Assume it's already in the expected [..., 2] format
+    return tensor
+
+# --- Mask Generation Helper Function ---
 def generate_undersampling_mask(shape: Tuple, AF: int, center_fraction: float, power: float) -> torch.Tensor:
     """
     Generates a 2D Cartesian undersampling mask with Variable Density.
@@ -76,7 +105,7 @@ class FastMRIBaseDataset(torch.utils.data.Dataset):
     def __init__(self, 
                  data_root: Path, 
                  manifest_path: Path, 
-                 acceleration_factor: int, 
+                 acceleration_factor: int = 4, 
                  center_fraction: float = 0.05, 
                  power: float = 4.0, 
                  target_resolution: Tuple[int, int] = (320, 320)):
@@ -159,16 +188,25 @@ class FastMRIBaseDataset(torch.utils.data.Dataset):
         # Apply the mask: Kspace [C, H, W] * Mask [1, H, W] (broadcasting handles the C dimension)
         kspace_masked = kspace_full * mask_tensor
         
-        return kspace_masked
+        return kspace_masked, mask_tensor
 
 
-# --- 2. Pipeline A: Real-Space Reconstruction Dataset (RealSpaceReconDataset) ---
+# --- 2. Pipeline A: Real-Space Reconstruction with optional Data Consistency Reinforcement Dataset (RealSpaceReconDataset) ---
 
 class RealSpaceReconDataset(FastMRIBaseDataset):
     """
-    Dataset for Pipeline A: Image-to-Image Reconstruction.
-    Returns: (Zero-filled magnitude image, Fully-sampled magnitude image)
+    Dataset for Pipeline A: Image-to-Image Reconstruction with optional soft Data Consistency Reinforcement
+    Returns: - (Zero-filled magnitude image, Fully-sampled magnitude image) for pipeline_mode = Unet_only
+             - (Masked K-Space) for pipeline_mode = Unet_DataConsistency
     """
+    def __init__(self, pipeline_mode: str = 'Unet_only', **kwargs):
+        super().__init__(**kwargs)
+        # Ensure mode is valid
+        if pipeline_mode not in ['Unet_only', 'Unet_DataConsistency']:
+            raise ValueError("pipeline_mode must be 'Unet_only' or 'Unet_DataConsistency'")
+        self.pipeline_mode = pipeline_mode
+        print(f"Dataset initialized in mode: {self.pipeline_mode}")
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         file_id, slice_idx, _ = self.samples[idx]
 
@@ -176,33 +214,21 @@ class RealSpaceReconDataset(FastMRIBaseDataset):
         kspace_full, global_image_max, _, _ = self._load_kspace_and_attributes(file_id, slice_idx)
 
         # Apply mask to generate undersampled k-space using the new helper method
-        kspace_masked = self._get_masked_kspace(kspace_full)
-
-        # --- CRITICAL FIX: Convert native complex tensors to [..., 2] format --- due to ifft2c restrictions
-        def to_fastmri_complex_format(kspace_tensor: torch.Tensor) -> torch.Tensor:
-            """
-            Converts native complex tensors (torch.complex64) to the [..., 2] 
-            format required by older fastmri IFFT functions (ifft2c).
-            """
-            if kspace_tensor.is_complex():
-                # Stack real and imaginary parts along a new last dimension
-                return torch.stack((kspace_tensor.real, kspace_tensor.imag), dim=-1)
-            # If it's already in the expected [..., 2] format, return as is
-            return kspace_tensor
+        kspace_masked, mask = self._get_masked_kspace(kspace_full)
 
         # Apply the conversion to both k-space tensors
         kspace_full = to_fastmri_complex_format(kspace_full)
         kspace_masked = to_fastmri_complex_format(kspace_masked)
-
+        mask = to_fastmri_complex_format(mask)
         # --- Transformation Steps (IFFT, Magnitude, SoS) ---
         
         # 1. Transform both full and masked k-space to image domain
         img_full_complex = ifft2c(kspace_full)
         img_masked_complex = ifft2c(kspace_masked)
 
-        # 2. Calculate Sum-of-Squares (SoS) Magnitude (single channel)
-        img_full_magnitude = complex_abs(img_full_complex).square()
-        img_masked_magnitude = complex_abs(img_masked_complex).square()
+        # 2. Calculate Magnitude (single channel)
+        img_full_magnitude = complex_abs(img_full_complex)#.square()
+        img_masked_magnitude = complex_abs(img_masked_complex)#.square()
 
         # 3. Center Crop
         img_full_magnitude = center_crop(img_full_magnitude, self.target_resolution)
@@ -215,9 +241,11 @@ class RealSpaceReconDataset(FastMRIBaseDataset):
         mean = img_full_magnitude.mean()
         std = img_full_magnitude.std()
         std_epsilon = std + 1e-11
-
+        max_value_tensor = torch.tensor(img_full_magnitude.max(), dtype=torch.float32)
+        
         img_full_norm = (img_full_magnitude - mean) / std_epsilon
-        img_masked_norm = img_masked_magnitude / img_masked_magnitude.max()
+        #img_masked_norm = img_masked_magnitude / img_masked_magnitude.max()
+        img_masked_norm = (img_masked_magnitude - mean) / std_epsilon
 
         # 5. Final PyTorch Tensor Formatting: [C, H, W]
         X = img_masked_norm.unsqueeze(0).float()
@@ -226,9 +254,15 @@ class RealSpaceReconDataset(FastMRIBaseDataset):
         # The mean and std must also be tensors for batching
         mean_tensor = torch.tensor(mean, dtype=torch.float32)
         std_tensor = torch.tensor(std, dtype=torch.float32)
-        max_value_tensor = torch.tensor(img_full_magnitude.max(), dtype=torch.float32)
+
+        # --- Conditional Return based on Pipeline Mode ---
+
+        if self.pipeline_mode == 'Unet_only':
+            return X, Y, mean_tensor, std_tensor, max_value_tensor
         
-        return X, Y, mean_tensor, std_tensor, max_value_tensor
+        elif self.pipeline_mode == 'Unet_DataConsistency':
+            return kspace_masked, mask, X, Y, mean_tensor, std_tensor, max_value_tensor
+
 
 # --- 3. Pipeline B: K-Space Reconstruction Dataset (KSpaceReconDataset) ---
 
@@ -272,7 +306,8 @@ class ClassificationDataset(FastMRIBaseDataset):
         # We only need the image max for normalization here
         kspace_full, global_image_max, _, _ = self._load_kspace_and_attributes(file_id, slice_idx)
         
-        # --- Transformation Steps (IFFT, Magnitude, SoS) ---
+        # Apply the conversion to k-space tensor
+        kspace_full = to_fastmri_complex_format(kspace_full)
         
         # 1. Transform to image domain
         img_full_complex = ifft2c(kspace_full)
