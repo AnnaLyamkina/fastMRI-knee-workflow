@@ -313,19 +313,27 @@ class ClassificationDataset(FastMRIBaseDataset):
         img_full_complex = ifft2c(kspace_full)
         
         # 2. Calculate Sum-of-Squares (SoS) Magnitude
-        img_full_magnitude = complex_abs(img_full_complex).square().sum(dim=0).sqrt()
+        img_full_magnitude = complex_abs(img_full_complex)
         
         # 3. Center Crop
         #crop_size = center_crop_to_smallest(img_full_magnitude.shape)
         # img_full_magnitude = center_crop(img_full_magnitude, crop_size)
         img_full_magnitude = center_crop(img_full_magnitude, self.target_resolution)
         
-        # 4. Normalization (using global_image_max from the 'max' attribute)
-        img_full_norm = img_full_magnitude / global_image_max
+        mean = img_full_magnitude.mean()
+        std = img_full_magnitude.std()
+
+        # 4. Normalization 
+        img_full_norm = (img_full_magnitude - mean) / std
         
-        # 5. Final PyTorch Tensor Formatting: [C, H, W]
+        # 5. Final PyTorch Tensor Formatting for a pretrained ResNet18: [3, H, W]
         X = img_full_norm.unsqueeze(0).float()
+        
+        #X_3channel = X.repeat(3, 1, 1) 
+
+        mean_tensor = torch.tensor(mean, dtype=torch.float32)
+        std_tensor = torch.tensor(std, dtype=torch.float32)
         L = torch.tensor(label_int).long()
         
-        return X, L
+        return X, L, mean_tensor, std_tensor
 

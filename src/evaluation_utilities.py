@@ -1,10 +1,14 @@
 import torch
 import torch.nn.functional as F
+import torchmetrics
 import torchmetrics.functional as tm
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import plotly.express as px
+from sklearn.metrics import roc_curve, roc_auc_score
 from src.models import denorm_image
 
 def calculate_metrics_on_sample(prediction, target_data, mean, std):
@@ -184,3 +188,189 @@ def visualize_metrics(rmse_scores, psnr_scores, ssim_scores, model_name = ""):
     plt.legend()
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.show()
+
+###########################
+## Classifier evaluation ##
+###########################
+
+def calculate_predictions(model, dataset):
+    """
+    Calculates predictions for a classifier
+    """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    model.to(device);
+    preds = []
+    labels = []
+
+    with torch.no_grad():
+        for data, label, _, _ in tqdm(dataset):
+            data = data.to(device).float().unsqueeze(0)
+            pred = torch.sigmoid(model(data)[0].cpu())
+            preds.append(pred)
+            labels.append(label)
+    preds = torch.tensor(preds)
+    labels = torch.tensor(labels).int()
+
+    return preds, labels
+
+def calculate_classifier_metrics(preds, labels):
+    threshold = []
+    accuracy= []
+    precision = []
+    f1 = []
+    recall = []
+    for t in np.linspace(0, 1, 20, endpoint=False):
+        threshold.append(t)
+        accuracy.append(torchmetrics.Accuracy(task='binary', threshold=t)(preds, labels).numpy().item())
+        precision.append(torchmetrics.Precision(task='binary', threshold=t)(preds, labels).numpy().item())
+        recall.append(torchmetrics.Recall(task='binary', threshold=t)(preds, labels).numpy().item())
+        f1.append(torchmetrics.F1Score(task='binary', threshold=t)(preds, labels).numpy().item())
+    df_metrics = pd.DataFrame({"threshold": threshold, "accuracy": accuracy, "precision": precision, "recall": recall, "f1_score": f1})
+    threshold_f1 = df_metrics.loc[df_metrics["f1_score"].idxmax()]["threshold"]
+    
+    return df_metrics, threshold_f1
+
+def show_confusion_matrix(preds, labels, threshold, model_name= "Classifier"):
+    cm = torchmetrics.ConfusionMatrix(task='binary', threshold=threshold)(preds, labels).numpy()
+    
+    plt.figure(figsize=(7, 6))
+    annotation_font_settings = {'fontsize': 18, 'fontweight': 'bold'}
+    sns.heatmap(
+        cm, 
+        annot=True, 
+        fmt='d',          
+        cmap='RdBu_r',    
+        linewidths=.5,    
+        cbar=True,        
+        linecolor='black',
+        annot_kws=annotation_font_settings
+    )
+    
+    # plt.xticks(ticks=np.arange(len(class_names)) + 0.5, labels=class_names, fontsize=12)
+    # plt.yticks(ticks=np.arange(len(class_names)) + 0.5, labels=class_names, rotation=0, fontsize=12)
+    
+    plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+    plt.ylabel('True Label (Actual)', fontsize=14, fontweight='bold')
+    plt.title(f'Confusion Matrix for {model_name} at Threshold = {threshold:.2f}', fontsize=16)
+    
+    # Optional: Add cell labels (TN, FP, FN, TP)
+    labels_pos = [
+        (0.25, 0.85, 'True Negatives (TN)'), 
+        (0.25, 0.35, 'False Positives (FP)'), 
+        (0.75, 0.85, 'False Negatives (FN)'), 
+        (0.75, 0.35, 'True Positives (TP)')
+    ]
+    
+    for x_offset, y_offset, text in labels_pos:
+        plt.text(
+            x_offset, y_offset, text, 
+            horizontalalignment='center', 
+            verticalalignment='center', 
+            color='black', 
+            fontsize=16, 
+            transform=plt.gca().transAxes
+        )
+        
+    plt.tight_layout()
+    plt.show()
+
+def plot_classifier_metrics_vs_threshold(df_metrics, optimal_threshold = None, model_name = "Classifier"):
+    """
+    Creates an interactive plot of classifier metrics plotted against the prediction threshold.
+    Outputs threshold and corresponding metrics for maximized F1 Score.
+
+    Args:
+        df_metrics(pd.DataFrame): DataFrame containing 'threshold', 'accuracy',
+                                        'recall', 'precision', and 'f1_score' columns.
+    """
+    
+    if optimal_threshold:
+        optimal_row = df_metrics.loc[df_metrics["threshold"] == optimal_threshold].iloc[0]
+    else:
+        optimal_row = df_metrics.loc[df_metrics['f1_score'].idxmax()]
+        optimal_threshold = optimal_row['threshold']
+    
+
+    print(f"--- Optimal Metrics")
+    print(f"Threshold: {optimal_threshold:.3f}")
+    print(f"Precision: {optimal_row['precision']:.3f}")
+    print(f"Recall:    {optimal_row['recall']:.3f}")
+    print("----------------------------------")
+    
+    fig = px.line(
+        df_metrics,
+        x='threshold',
+        y=["accuracy","precision", "recall", "f1_score"],
+        title=f'Classifier Performance Metrics vs. Prediction Threshold for {model_name}',
+        markers=True,
+        color_discrete_map={
+            'precision': '#2196F3', # Blue
+            'recall': '#FF9800',    # Orange
+            'accuracy': '#4CAF50',   # Green,
+            'f1_score': 'red'
+        },
+        height=800,
+        width = 800
+    )
+
+    fig.add_vline(
+        x= optimal_row['threshold'], 
+        line_dash="dash", 
+        line_color="red", 
+        line_width=3, 
+        annotation_text=f"Optimal F1 Threshold: {optimal_row['threshold']:.2f}",
+        annotation_position="top right"
+    )
+
+    fig.update_layout(
+        # xaxis_range=[0, 1.05],
+        # yaxis_range=[0, 1.05],
+        xaxis_title='Prediction Threshold',
+        yaxis_title='Metric Value',
+        hovermode='x unified',
+        template='simple_white',
+        legend_title_text='Metric',
+        title_x=0.5
+    )
+
+    fig.show()
+
+def plot_roc_curve_and_auc(scores, labels, model_name="Classifier Model"):
+    """
+    Calculates and plots the Receiver Operating Characteristic (ROC) curve 
+    and determines the Area Under the Curve (AUC).
+
+    Args:
+        scores (list or numpy.array): The predicted probability scores
+                                              for the positive class.
+        labels (list or numpy.array): The true binary labels (0 or 1).
+        model_name (str): The name of the model for the plot title.
+    """
+    
+    fpr, tpr, _ = roc_curve(labels, scores)
+    
+    roc_auc = roc_auc_score(labels, scores)
+    
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, color='#4f46e5', lw=3, 
+             label=f'ROC curve ({model_name}) (AUC = {roc_auc:.4f})')
+    
+    plt.plot([0, 1], [0, 1], color='#f87171', lw=2, linestyle='--', 
+             label='Random Chance (AUC = 0.5)')
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    
+    plt.xlabel('False Positive Rate (FPR)', fontsize=14)
+    plt.ylabel('True Positive Rate (TPR) / Recall', fontsize=14)
+    plt.title(f'Receiver Operating Characteristic (ROC) Curve for {model_name}', fontsize=16)
+    
+    plt.grid(color='gray', linestyle=':', linewidth=0.5)
+    
+    plt.legend(loc="lower right", fontsize=12, frameon=True, shadow=True)
+
+    plt.tight_layout()
+    plt.show()
+    
+    return roc_auc
